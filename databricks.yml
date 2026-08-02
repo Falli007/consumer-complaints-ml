@@ -1,0 +1,19 @@
+bundle:
+  name: consumer-complaints-ml
+
+include:
+  - databricks/resources/*.yml
+
+sync:
+  include:
+    - databricks/src/**/*.py
+    - databricks/notebooks/**/*.ipynb
+
+targets:
+  dev:
+    default: true
+    mode: development
+
+    workspace:
+      host: https://dbc-cf5e754b-fc10.cloud.databricks.com
+      root_path: /Workspace/Users/${workspace.current_user.userName}/.bundle/${bundle.name}/${bundle.target}
