@@ -4,7 +4,7 @@ resources:
       name: consumer-complaints-pipeline-${bundle.target}
 
       description: >
-        Runs the Consumer Complaints Bronze and Silver pipeline.
+        Runs the Consumer Complaints Bronze, Silver, and Gold pipeline.
 
       max_concurrent_runs: 1
 
@@ -25,6 +25,18 @@ resources:
 
           spark_python_task:
             python_file: ../src/silver/consumer_complaints_silver.py
+            source: WORKSPACE
+
+          environment_key: default
+          timeout_seconds: 14400
+
+        - task_key: create_consumer_complaints_gold
+
+          depends_on:
+            - task_key: create_consumer_complaints_silver
+
+          spark_python_task:
+            python_file: ../src/gold/consumer_complaints_gold.py
             source: WORKSPACE
 
           environment_key: default
