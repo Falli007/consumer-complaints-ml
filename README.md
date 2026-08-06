@@ -28,34 +28,46 @@ I organized it as four connected stages:
 
 ## Architecture overview
 
-```
-CFPB dataset (S3)
-      |
-      v
-Bronze table (fintech_lakehouse_dev.bronze)      raw data, as ingested
-      |
-      v
-Silver table (fintech_lakehouse_dev.silver)      cleaned, validated, deduplicated
-      |
-      v
-Gold layer (fintech_lakehouse_dev.gold)          dimensional warehouse: fact + dim tables
-      |
-      v
-ML feature table (fintech_lakehouse_dev.gold)    complaint-level model input table
-      |
-      v
-Training pipeline (pandas / scikit-learn / XGBoost, run on Databricks)
-      |
-      v
-Champion model (Unity Catalog Volume: fintech_lakehouse_dev.monitoring.model_exports)
-      |
-      v
-Flask app (local)                                 scores one complaint at a time
+```mermaid
+flowchart TD
+    S3["CFPB dataset<br/>Amazon S3"]
+
+    subgraph databricks["Databricks (Unity Catalog: fintech_lakehouse_dev), orchestrated by one Databricks Asset Bundle"]
+        direction TB
+        Bronze["Bronze table<br/>bronze.consumer_complaints<br/>raw data, as ingested"]
+        Silver["Silver table<br/>silver.silver_consumer_complaints<br/>cleaned, validated, deduplicated"]
+
+        subgraph gold["Gold: dimensional warehouse"]
+            direction LR
+            Fact["fact_consumer_complaints"]
+            Dims["dim_date, dim_product,<br/>dim_company, dim_state"]
+        end
+
+        Features["ML feature table<br/>gold.consumer_complaints_timely_response_features<br/>TRAIN / VALIDATION / TEST split"]
+
+        subgraph training["Training pipeline: pandas / scikit-learn / XGBoost"]
+            direction LR
+            Models["Decision Tree, Random Forest,<br/>XGBoost - target-encoded,<br/>sigmoid-calibrated"]
+            Metrics["Metrics + predictions<br/>monitoring schema (Delta tables)"]
+        end
+
+        Volume["Champion model artifacts<br/>Unity Catalog Volume:<br/>monitoring.model_exports<br/>champion_model.joblib +<br/>serving_metadata_champion.json"]
+    end
+
+    Flask["Flask app (local, outside Databricks)<br/>loads the model, scores one<br/>complaint via web form or JSON API"]
+
+    S3 --> Bronze --> Silver --> gold
+    gold --> Features --> training
+    Models --> Metrics
+    Models --> Volume
+    Volume -. "databricks fs cp /<br/>refresh_model.ps1" .-> Flask
 ```
 
-Everything upstream of the Flask app runs on Databricks, orchestrated as Databricks Jobs I defined
-in a Databricks Asset Bundle (`databricks.yml`). The Flask app is the only part of this project
-that runs outside Databricks.
+Everything inside the Databricks box runs as Databricks Jobs I defined in a Databricks Asset
+Bundle (`databricks.yml`): one job runs Bronze, Silver and Gold in sequence, a second builds the
+ML feature table and then runs training. The Flask app is the only part of this project that runs
+outside Databricks, and it only ever reads the two exported artifact files, never Databricks
+compute directly.
 
 ## 1. Ingestion
 
@@ -307,11 +319,27 @@ Three separate environments are involved, each with its own dependencies:
    set (scikit-learn, XGBoost, joblib) is unrelated to the ingestion script's. See
    [Model serving](#4-model-serving-flask-app) above.
 
-Run the ingestion test suite with:
+All tests live under `tests/`, but they need different interpreters depending on what they cover.
+Running `python -m unittest discover -s tests -v` with the base interpreter runs the ingestion
+tests and automatically skips the ML/Flask tests (they say why in the skip reason, rather than
+silently passing):
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+To actually run the ML pipeline and Flask app tests, use the Flask app's virtual environment,
+since it already has the same scikit-learn/XGBoost/pandas versions the training script needs:
+
+```powershell
+flask_app\.venv\Scripts\python.exe -m unittest tests.test_consumer_complaints_ml_train -v
+flask_app\.venv\Scripts\python.exe -m unittest tests.test_flask_app -v
+```
+
+`test_flask_app.py` also includes a smoke test that catches a real bug I hit once during
+development: `champion_model.joblib`'s `feature_names_in_` silently drifting out of sync with
+`serving_metadata.json`'s `selected_feature_columns` (a stale file from a losing model run). That
+test is skipped if `flask_app/model/` is empty; run `flask_app\refresh_model.ps1` first.
 
 ## Engineering tradeoffs and open items
 
@@ -333,6 +361,10 @@ python -m unittest discover -s tests -v
   training work.
 - I fixed hyperparameters for all three models by hand rather than tuning them via cross-validation
   by default; an optional `ENABLE_HYPERPARAMETER_TUNING` flag runs a `GridSearchCV` search instead
-  when turned on.
+  when turned on. I verified the tuned path end to end on Databricks: it picked different
+  hyperparameters and improved test AUC-PR for two of the three models (XGBoost 0.403 to 0.416,
+  Random Forest 0.324 to 0.339), so it is left off by default because it costs meaningfully more
+  training time for a gain worth confirming is consistent across more than one run, not because it
+  is unverified or broken.
 - There is no automated retraining schedule or drift monitoring yet; the model is a manually
   triggered batch training job today.

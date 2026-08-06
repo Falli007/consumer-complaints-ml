@@ -15,7 +15,15 @@ model registry involved:
   decision threshold. The model itself only understands already-encoded numbers, so this file is
   required to score a brand-new, raw complaint.
 
-To refresh both after retraining, copy them down from the Volume:
+To refresh both after retraining, run:
+
+```powershell
+cd flask_app
+.\refresh_model.ps1
+```
+
+This wraps the two `databricks fs cp` commands below (pass `-Profile <name>` if you use a
+different Databricks CLI profile than `consumer-complaints-dev`):
 
 ```powershell
 databricks fs cp "dbfs:/Volumes/fintech_lakehouse_dev/monitoring/model_exports/champion_model.joblib" flask_app/model/champion_model.joblib --profile consumer-complaints-dev --overwrite

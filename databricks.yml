@@ -16,6 +16,9 @@ sync:
   # is a purely local artifact that never runs on Databricks.
   exclude:
     - flask_app/**
+    - docs/**
+    - tests/**
+    - ingestion/**
 
 targets:
   dev:
