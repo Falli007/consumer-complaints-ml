@@ -63,7 +63,7 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import KFold, train_test_split
+from sklearn.model_selection import GridSearchCV, KFold, train_test_split
 from sklearn.tree import DecisionTreeClassifier
 
 try:
@@ -114,6 +114,11 @@ CATEGORICAL_FEATURE_COLUMNS = [
     "received_day_name",
 ]
 
+# TODO: "has_consumer_narrative" is a binary presence flag only; the actual narrative text is not
+# used as a feature anywhere in this pipeline. Real text features (e.g. embeddings from a
+# pretrained transformer) are a plausible source of additional signal but are out of scope for
+# this iteration - they need new plumbing in Silver/Gold to retain the raw text, plus new
+# feature-engineering and training work. Do not add this without first scoping that work properly.
 NUMERIC_FEATURE_COLUMNS = [
     "complaint_received_year",
     "complaint_received_quarter",
@@ -427,12 +432,26 @@ def select_top_features(train_pdf: pd.DataFrame) -> tuple[list[str], list[tuple[
 # Fit Decision Tree, Random Forest, and XGBoost on the selected
 # feature representation for a fair comparison.
 # ------------------------------------------------------------
-# ASSUMPTION (opinion, not confirmed with stakeholders): this model is a compliance/monitoring
-# signal, so a missed truly-late complaint (false negative) is treated as costlier than an
-# over-flagged timely one (false positive). This constant is the one thing to change if that
-# cost asymmetry is wrong.
+# NEEDS STAKEHOLDER REVIEW: this value is an unconfirmed assumption, not an approved business
+# requirement. ASSUMPTION (opinion): this model is a compliance/monitoring signal, so a missed
+# truly-late complaint (false negative) is treated as costlier than an over-flagged timely one
+# (false positive). This constant is the one thing to change if that cost asymmetry is wrong;
+# confirm the real number with whoever owns the downstream use of this prediction before relying
+# on it in production.
 TARGET_RECALL_FLOOR = 0.75
 CALIBRATION_METHOD = "sigmoid"  # See _fit_score_and_log_model for why isotonic was rejected.
+
+# Off by default: a grid search multiplies training time by len(grid) * CV_FOLDS per model, and
+# the hand-picked defaults below were already tuned somewhat through manual iteration. Set True to
+# search a small grid per model (scored by AUC-PR, the right metric under this class imbalance)
+# instead of using the fixed hyperparameters in train_and_score_models.
+ENABLE_HYPERPARAMETER_TUNING = False
+HYPERPARAMETER_TUNING_CV_FOLDS = 3
+HYPERPARAMETER_GRIDS: dict[str, dict[str, list]] = {
+    "decision_tree": {"max_depth": [6, 8, 10], "min_samples_leaf": [25, 50, 100]},
+    "random_forest": {"n_estimators": [50, 80, 120], "max_depth": [8, 10, 12]},
+    "spark_xgboost": {"max_depth": [6, 8, 10], "learning_rate": [0.05, 0.1, 0.2]},
+}
 
 
 def _select_threshold_for_recall_floor(labels: pd.Series, probabilities: np.ndarray, recall_floor: float) -> float:
@@ -453,6 +472,43 @@ def _select_threshold_for_recall_floor(labels: pd.Series, probabilities: np.ndar
     return float(thresholds[best_index])
 
 
+def _fit_with_optional_tuning(
+    model_name: str,
+    model: object,
+    train_pdf: pd.DataFrame,
+    selected_feature_columns: list[str],
+) -> object:
+    """Fit model on TRAIN, optionally hyperparameter-tuned via cross-validated grid search.
+
+    Gated behind ENABLE_HYPERPARAMETER_TUNING (off by default). When enabled, GridSearchCV both
+    searches and does the final fit (refit=True is the default), so no separate .fit() call is
+    needed afterward either way.
+    """
+
+    X_train = train_pdf[selected_feature_columns]
+    y_train = train_pdf[LABEL_COLUMN]
+    sample_weight = train_pdf[WEIGHT_COLUMN]
+
+    param_grid = HYPERPARAMETER_GRIDS.get(model_name)
+    if ENABLE_HYPERPARAMETER_TUNING and param_grid:
+        search = GridSearchCV(
+            model,
+            param_grid,
+            scoring="average_precision",  # Matches the metric used to pick the champion model.
+            cv=HYPERPARAMETER_TUNING_CV_FOLDS,
+            n_jobs=-1,
+        )
+        search.fit(X_train, y_train, sample_weight=sample_weight)
+        LOGGER.info(
+            "Tuned %s via %s-fold CV: best_params=%s, best_cv_auc_pr=%.4f",
+            model_name, HYPERPARAMETER_TUNING_CV_FOLDS, search.best_params_, search.best_score_,
+        )
+        return search.best_estimator_
+
+    model.fit(X_train, y_train, sample_weight=sample_weight)
+    return model
+
+
 def _fit_score_and_log_model(
     model_name: str,
     model: object,
@@ -463,7 +519,7 @@ def _fit_score_and_log_model(
     encoding_maps: dict[str, dict[str, float]],
     global_positive_rate: float,
 ) -> dict[str, object]:
-    """Fit, calibrate, pick a recall-floor threshold, and log/register the model with MLflow.
+    """Fit, calibrate, pick a recall-floor threshold, and write the model's serving metadata.
 
     Class weighting during training distorts predicted probabilities, so a calibration step is
     required before those probabilities can be used for thresholding. Calibration is fit on half
@@ -471,11 +527,7 @@ def _fit_score_and_log_model(
     both to fit the calibrator and to pick/evaluate the threshold. TEST remains untouched.
     """
 
-    model.fit(
-        train_pdf[selected_feature_columns],
-        train_pdf[LABEL_COLUMN],
-        sample_weight=train_pdf[WEIGHT_COLUMN],
-    )
+    model = _fit_with_optional_tuning(model_name, model, train_pdf, selected_feature_columns)
 
     validation_calibration_pdf, validation_threshold_pdf = train_test_split(
         validation_pdf, test_size=0.5, stratify=validation_pdf[LABEL_COLUMN], random_state=42,
@@ -817,8 +869,31 @@ def validate_monitoring_outputs(spark: SparkSession) -> None:
 
 
 # ------------------------------------------------------------
-# Run the full tree-based training flow after the feature table
-# has been built and validated.
+# Placeholder drift-check hook, run at the end of every training
+# job. Not implemented yet: see the TODO in the docstring.
+# ------------------------------------------------------------
+def check_for_drift(feature_pandas_df: pd.DataFrame) -> None:
+    """Placeholder for input/label drift monitoring. Not implemented yet.
+
+    TODO: no baseline distribution is stored or compared against today. Wire this up to compare
+    this run's TRAIN split statistics (e.g. positive rate, per-category frequencies for the
+    categorical columns) against a stored historical baseline (a small table would do), and
+    log/alert if they diverge beyond some threshold. Until that exists, this is a no-op so the
+    call site in main() has somewhere to plug it in without restructuring the training flow later.
+    """
+
+    LOGGER.info(
+        "Drift check: not yet implemented (placeholder hook, see check_for_drift() docstring)."
+    )
+
+
+# ------------------------------------------------------------
+# Manually triggered batch training entrypoint. Invoked both by
+# direct execution (`python consumer_complaints_ml_train.py`) and
+# by the Databricks Job task that runs this script - there is no
+# separate/different entrypoint for the scheduled path today,
+# because there is no scheduled path yet (see check_for_drift and
+# the module docstring for what is still missing on that front).
 # ------------------------------------------------------------
 def main() -> None:
     """Train and evaluate the tree-based untimely-response models."""
@@ -844,6 +919,7 @@ def main() -> None:
 
     write_monitoring_tables(spark, metrics_dataframe, predictions_dataframe)
     validate_monitoring_outputs(spark)
+    check_for_drift(feature_pandas_df)
 
     top_selected_features = feature_importance_pairs[:TOP_FEATURE_COUNT]
     LOGGER.info(
