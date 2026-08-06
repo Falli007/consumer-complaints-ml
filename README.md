@@ -1,38 +1,16 @@
 # Consumer Complaints Lakehouse and ML Pipeline
 
-I built this project to ingest the CFPB Consumer Complaint Database, build a full Bronze, Silver
-and Gold lakehouse on Databricks with Unity Catalog, train a tree-based machine learning model to
-predict untimely complaint responses, and serve that model through a local Flask app.
+Ingests the CFPB Consumer Complaint Database, builds a Bronze/Silver/Gold lakehouse on Databricks
+with Unity Catalog, trains a model to predict untimely complaint responses, and serves it through
+a local Flask app.
 
-I organized it as four connected stages:
-
-1. Ingestion: download the raw CFPB dataset and upload it to Amazon S3.
-2. Data engineering: Bronze, Silver and Gold pipelines on Databricks, built with PySpark and
-   Delta Lake, orchestrated as a Databricks Job through a Databricks Asset Bundle.
-3. Machine learning: a Gold-layer feature table, then a training pipeline that compares Decision
-   Tree, Random Forest and XGBoost models and saves the best one.
-4. Serving: a small Flask app that loads the trained model and scores a single complaint through
-   a web form or a JSON API.
-
-## Table of contents
-
-- [Architecture overview](#architecture-overview)
-- [1. Ingestion](#1-ingestion)
-- [2. Data engineering: Bronze, Silver, Gold](#2-data-engineering-bronze-silver-gold)
-- [3. Machine learning pipeline](#3-machine-learning-pipeline)
-- [4. Model serving: Flask app](#4-model-serving-flask-app)
-- [Databricks Asset Bundle](#databricks-asset-bundle)
-- [Repository structure](#repository-structure)
-- [Setup](#setup)
-- [Engineering tradeoffs and open items](#engineering-tradeoffs-and-open-items)
-
-## Architecture overview
+## Architecture
 
 ```mermaid
 flowchart TD
     S3["CFPB dataset<br/>Amazon S3"]
 
-    subgraph databricks["Databricks (Unity Catalog: fintech_lakehouse_dev), orchestrated by one Databricks Asset Bundle"]
+    subgraph databricks["Databricks (Unity Catalog: fintech_lakehouse_dev), one Databricks Asset Bundle"]
         direction TB
         Bronze["Bronze table<br/>bronze.consumer_complaints<br/>raw data, as ingested"]
         Silver["Silver table<br/>silver.silver_consumer_complaints<br/>cleaned, validated, deduplicated"]
@@ -45,213 +23,80 @@ flowchart TD
 
         Features["ML feature table<br/>gold.consumer_complaints_timely_response_features<br/>TRAIN / VALIDATION / TEST split"]
 
-        subgraph training["Training pipeline: pandas / scikit-learn / XGBoost"]
+        subgraph training["Training: pandas / scikit-learn / XGBoost"]
             direction LR
             Models["Decision Tree, Random Forest,<br/>XGBoost - target-encoded,<br/>sigmoid-calibrated"]
             Metrics["Metrics + predictions<br/>monitoring schema (Delta tables)"]
         end
 
-        Volume["Champion model artifacts<br/>Unity Catalog Volume:<br/>monitoring.model_exports<br/>champion_model.joblib +<br/>serving_metadata_champion.json"]
+        Volume["Champion model artifacts<br/>Unity Catalog Volume:<br/>monitoring.model_exports"]
     end
 
-    Flask["Flask app (local, outside Databricks)<br/>loads the model, scores one<br/>complaint via web form or JSON API"]
+    Flask["Flask app (local, outside Databricks)<br/>scores one complaint via<br/>web form or JSON API"]
 
     S3 --> Bronze --> Silver --> gold
     gold --> Features --> training
     Models --> Metrics
     Models --> Volume
-    Volume -. "databricks fs cp /<br/>refresh_model.ps1" .-> Flask
+    Volume -. "refresh_model.ps1" .-> Flask
 ```
 
-Everything inside the Databricks box runs as Databricks Jobs I defined in a Databricks Asset
-Bundle (`databricks.yml`): one job runs Bronze, Silver and Gold in sequence, a second builds the
-ML feature table and then runs training. The Flask app is the only part of this project that runs
-outside Databricks, and it only ever reads the two exported artifact files, never Databricks
-compute directly.
+Two Databricks Jobs, defined in `databricks.yml`: one runs Bronze/Silver/Gold, the other builds
+the ML feature table and trains. Flask is the only piece that runs outside Databricks.
 
-## 1. Ingestion
+## Ingestion
 
-Location: `ingestion/consumer_complaints/download_to_s3.py`, tested in `tests/`.
-
-A standalone script I wrote that downloads the CFPB Consumer Complaint Database ZIP file and
-uploads it to an S3 bucket using multipart transfer, then verifies the uploaded object. It
-generates the ingestion date at runtime from the current UTC date and uses it in both the S3 key
-and the S3 object metadata, so every run is timestamped and traceable.
-
-Run it with:
+`ingestion/consumer_complaints/download_to_s3.py` downloads the CFPB ZIP and uploads it to S3.
 
 ```powershell
 $env:S3_BUCKET_NAME = "your-bucket-name"
 python ingestion\consumer_complaints\download_to_s3.py
 ```
 
-Downloaded data is stored locally under `data/` before upload; that directory, along with ZIP
-files, virtual environments and Python cache files, is excluded from Git.
+## Data engineering: Bronze, Silver, Gold
 
-## 2. Data engineering: Bronze, Silver, Gold
+`.py` scripts under `databricks/src/` are the production entry points. Matching notebooks under
+`databricks/notebooks/` mirror the same logic. Catalog: `fintech_lakehouse_dev`.
 
-All data engineering code lives under `databricks/`, with a parallel `.py` script and `.ipynb`
-notebook for every stage I built. The `.py` files are the production entry points wired into the
-Databricks Job; the notebooks mirror the same logic for interactive exploration and review.
+- **Bronze** (`src/bronze/`): raw CSV from S3, written mostly unchanged.
+- **Silver** (`src/silver/`): cleaned, typed, deduplicated. Validation SQL in `databricks/sql/silver/`.
+- **Gold** (`src/gold/`): dimensional warehouse. `fact_consumer_complaints` plus `dim_date`,
+  `dim_product`, `dim_company`, `dim_state`. Validation in `databricks/sql/gold/`.
 
-Catalog used throughout: `fintech_lakehouse_dev`.
+## Machine learning
 
-### Bronze (`databricks/src/bronze/consumer_complaints_bronze.py`)
+**Feature engineering** (`src/ml/consumer_complaints_ml_features.py`): joins Gold into one
+complaint-level table, derives the `label_untimely_response` target, writes a TRAIN/VALIDATION/TEST
+split.
 
-Reads the raw CFPB CSV from S3 and writes it, largely unchanged, into
-`fintech_lakehouse_dev.bronze.consumer_complaints` as a managed Delta table. This is the
-"as-ingested" copy of the source data: minimal transformation, so I can always recover the
-original data if I find a downstream bug later.
+**Training** (`src/ml/consumer_complaints_ml_train.py`): pandas/scikit-learn/XGBoost, not Spark
+ML (this workspace's serverless compute doesn't reliably support `pyspark.ml`).
 
-### Silver (`databricks/src/silver/consumer_complaints_silver.py`)
+- Target encoding for categoricals, out-of-fold on TRAIN.
+- Class weighting for the rare positive class (~0.6%), sigmoid calibration afterward.
+- Decision threshold picked on a validation-only recall floor (75%).
+- Decision Tree, Random Forest, XGBoost compared by validation AUC-PR; best one exported as champion.
+- TEST is only touched for final reporting.
 
-Reads from the Bronze table, applies cleaning, type casting, deduplication and data quality
-checks, and writes `fintech_lakehouse_dev.silver.silver_consumer_complaints`. I wrote SQL
-validation scripts for this stage, in `databricks/sql/silver/`:
+**Model artifacts**: `champion_model.joblib` + `serving_metadata_champion.json`, written together
+to a Unity Catalog Volume with `joblib.dump()` and plain JSON. No MLflow.
 
-- `01_bronze_profile.sql`: profiles the raw Bronze table before cleaning.
-- `02_data_quality_checks.sql`: checks for nulls, duplicates and invalid values.
-- `03_silver_validation.sql`: validates the cleaned Silver output.
+## Model serving: Flask app
 
-### Gold (`databricks/src/gold/consumer_complaints_gold.py`)
+`flask_app/app.py` loads `champion_model.joblib` + `serving_metadata.json` and exposes:
 
-Builds a dimensional warehouse on top of Silver: a fact table plus supporting dimension tables,
-all under `fintech_lakehouse_dev.gold`:
+- `GET /`: form, built from the serving metadata.
+- `POST /predict`: JSON in, target-encoded, prediction out.
+- `GET /health`: model/metadata load check.
 
-- `fact_consumer_complaints`: one row per complaint, with foreign keys into the dimension tables.
-- `dim_date`: calendar dimension for complaint intake dates.
-- `dim_product`: complaint product/sub-product categories.
-- `dim_company`: companies complaints were filed against.
-- `dim_state`: US state/territory dimension.
-
-Validation for this layer lives in `databricks/sql/gold/01_gold_validation.sql`. Screenshots I
-took of each dimension table and the resulting output are under `docs/screenshots/gold/`.
-
-## 3. Machine learning pipeline
-
-I built the ML pipeline in two stages, both under `databricks/notebooks/` (interactive) and
-`databricks/src/ml/` (the production entry points).
-
-### Feature engineering (`consumer_complaints_ml_features`)
-
-Reads the Gold fact and dimension tables, joins them into a single complaint-level table, derives
-the binary target label (`label_untimely_response`, whether a complaint's response was late), and
-writes a deterministic TRAIN/VALIDATION/TEST split into a managed feature table:
-`fintech_lakehouse_dev.gold.consumer_complaints_timely_response_features`. I kept this step as
-pure Spark SQL/DataFrame work and run it entirely on Databricks Spark, since it operates over the
-full complaint volume.
-
-### Training (`consumer_complaints_ml_train`)
-
-Reads the feature table and trains a baseline classifier to predict untimely responses. I run
-this step on pandas, scikit-learn and XGBoost rather than Spark ML: I found that this workspace's
-serverless compute does not reliably support classic `pyspark.ml` (constructor whitelisting
-issues on some environment versions, no Spark JVM context at all on others, and Spark Connect ML
-session cache limits on the one version where it does run), and the reduced, already-aggregated
-feature table is small enough for me to train comfortably on the driver instead.
-
-The training flow I built, in order:
-
-1. Validate the feature table exists and all three splits (TRAIN/VALIDATION/TEST) are non-empty.
-2. Collect the model-input columns into pandas, capped at 500,000 rows per split (a representative
-   sample is standard practice for a baseline tree model; I also found multi-million-row
-   `toPandas()` transfers to be unreliable on this workspace at full volume).
-3. Compute a class weight from the TRAIN split to address the rare positive class (roughly 0.6
-   percent of complaints are untimely).
-4. Target-encode the ten categorical columns (company, product, state, and so on) using each
-   category's smoothed historical positive rate, rather than an arbitrary ordinal integer code.
-   I encode TRAIN rows out-of-fold (5-fold) so a row's own label never leaks into its own encoded
-   value; I encode VALIDATION and TEST using the full TRAIN split's statistics. This change alone
-   roughly tripled AUC-PR across all three models compared to ordinal encoding, since ordinal
-   codes falsely imply an order between unrelated categories like company names.
-5. Use a Random Forest's feature importances to select the top 10 of 18 candidate input columns.
-6. Train Decision Tree, Random Forest and XGBoost classifiers on the selected features, each with
-   a sample weight column to account for class imbalance.
-7. Calibrate each model's predicted probabilities. Class weighting during training distorts raw
-   probabilities, so this step is required before using them for thresholding. I fit calibration
-   with Platt/sigmoid scaling on half of the VALIDATION split; I tried isotonic calibration first
-   and rejected it because it degenerated under this level of class imbalance with a modest
-   calibration fold, collapsing to near-zero probabilities almost everywhere.
-8. Select a decision threshold on the other half of VALIDATION, targeting a recall floor (75
-   percent, confirmed - see [Engineering tradeoffs](#engineering-tradeoffs-and-open-items) below)
-   rather than maximizing F1. F1 weights precision and recall equally, which is the wrong
-   objective for a compliance-style signal where a missed untimely complaint is costlier than an
-   over-flagged timely one.
-9. Evaluate every model on VALIDATION and TEST: AUC-ROC, AUC-PR, precision, recall, F2 and a full
-   confusion matrix, all persisted to
-   `fintech_lakehouse_dev.monitoring.consumer_complaints_timely_response_model_metrics`.
-10. Persist scored TEST predictions to
-    `fintech_lakehouse_dev.monitoring.consumer_complaints_timely_response_test_predictions`.
-11. Pick the model with the best validation AUC-PR (AUC-PR, not AUC-ROC or accuracy, since it is
-    the appropriate ranking metric under this level of class imbalance) and write it as the
-    deployable champion: see [Model artifacts](#model-artifacts) below.
-
-I never touch TEST for calibration, threshold selection or feature selection; I only use it for
-final reporting, to keep the reported metrics honest.
-
-### Model artifacts
-
-I write the champion model and everything needed to serve it directly to a Unity Catalog Volume,
-`fintech_lakehouse_dev.monitoring.model_exports`, using plain `joblib.dump()` and JSON file
-writes:
-
-- `champion_model.joblib`: the calibrated scikit-learn/XGBoost estimator.
-- `serving_metadata_champion.json`: the serving contract, written atomically alongside the model
-  in the same step so the two files can never drift out of sync. It records the selected feature
-  columns, the target-encoding maps for each categorical column, the global fallback rate for
-  unseen categories, and the selected decision threshold.
-- `serving_metadata_<model_name>.json`: the same metadata for each individually trained model,
-  kept for inspection even when that model is not the champion.
-
-I tried MLflow's experiment tracking and Unity Catalog model registry first for this step and
-found them unreliable on this workspace's serverless compute: registered-model artifact download
-failed, model registration failed silently under a broad exception handler, logging a model
-crashed reading a Spark configuration value the compute does not allow reading, and eventually
-even the plain act of starting an MLflow run crashed the same way. None of this is a property of
-MLflow generally; it reflects a specific incompatibility between MLflow's Databricks integration
-and this workspace's serverless/Spark Connect compute. Writing plain files to a Volume avoided
-all of it, since it is a normal filesystem write rather than an MLflow artifact-store operation. I
-still track model evaluation metrics in the Delta table described above, which was already the
-actual source of truth I used throughout this project.
-
-## 4. Model serving: Flask app
-
-Location: `flask_app/`. This is the only part of the project that runs outside Databricks.
-
-The app loads `champion_model.joblib` and `serving_metadata.json` (copied down from the Volume,
-see below) and exposes:
-
-- `GET /`: a simple HTML form, dynamically built from `serving_metadata.json` so it only ever
-  asks for the raw fields the current champion model actually needs.
-- `POST /predict`: accepts a JSON body of raw complaint fields, applies the same target encoding
-  used during training, scores it with the model, and returns the predicted probability, the
-  binary prediction and the threshold that was applied.
-- `GET /health`: reports whether the model and serving metadata loaded successfully.
-
-Because the model only understands already-encoded numbers, `encode_request()` in `app.py`
-re-applies the exact target-encoding maps recorded in `serving_metadata.json` to any raw
-complaint before scoring it; an unseen category (a company the model never saw in training, for
-example) falls back to the global training-set positive rate rather than failing.
-
-### Refreshing the model
-
-After retraining on Databricks, I pull the two artifact files down from the Volume with one
-script:
+**Refresh the model:**
 
 ```powershell
 cd flask_app
 .\refresh_model.ps1
 ```
 
-That wraps the two `databricks fs cp` commands (pass `-Profile <name>` if you use a different
-Databricks CLI profile than `consumer-complaints-dev`):
-
-```powershell
-databricks fs cp "dbfs:/Volumes/fintech_lakehouse_dev/monitoring/model_exports/champion_model.joblib" flask_app/model/champion_model.joblib --profile consumer-complaints-dev --overwrite
-databricks fs cp "dbfs:/Volumes/fintech_lakehouse_dev/monitoring/model_exports/serving_metadata_champion.json" flask_app/model/serving_metadata.json --profile consumer-complaints-dev --overwrite
-```
-
-### Running the app
+**Run it:**
 
 ```powershell
 cd flask_app
@@ -261,26 +106,9 @@ pip install -r requirements.txt
 python app.py
 ```
 
-Then open `http://localhost:5000` in a browser, or call `POST /predict` directly with a JSON
-body. Full details and an example request are in `flask_app/README.md`.
+Open `http://localhost:5000`, or call `POST /predict` directly. Details in `flask_app/README.md`.
 
 ## Databricks Asset Bundle
-
-I defined the whole Databricks side of this project (Bronze, Silver, Gold and the ML pipeline) as
-a single Databricks Asset Bundle, configured in `databricks.yml`, with job definitions under
-`databricks/resources/`.
-
-Two Databricks Jobs are defined:
-
-- `consumer_complaints_bronze_job` (in `consumer_complaints_job.yml`... see the resources file for
-  exact task names): runs the Bronze, Silver and Gold tasks in sequence.
-- `consumer_complaints_ml_job`: builds the ML feature table, then runs the training pipeline.
-
-Only `databricks/src/**/*.py` and `databricks/notebooks/**/*.ipynb` are synced to the Databricks
-workspace; I explicitly excluded `flask_app/` and other local-only directories in `databricks.yml`,
-since Flask never runs on Databricks and does not need to be uploaded there.
-
-Common commands, using the `dev` target:
 
 ```powershell
 databricks bundle validate --profile consumer-complaints-dev -t dev
@@ -289,93 +117,50 @@ databricks bundle run consumer_complaints_bronze_job -t dev --profile consumer-c
 databricks bundle run consumer_complaints_ml_job -t dev --profile consumer-complaints-dev
 ```
 
+Only `databricks/src/**/*.py` and `databricks/notebooks/**/*.ipynb` sync to the workspace.
+`flask_app/`, `docs/`, `tests/`, `ingestion/` are excluded.
+
 ## Repository structure
 
 ```
 ingestion/consumer_complaints/       S3 ingestion script
-tests/                               Unit tests for the ingestion script
+tests/                               Unit tests
 databricks/
-  notebooks/                         Interactive notebooks: bronze, silver, gold, ml_features, ml_train
-  src/
-    bronze/                          Bronze pipeline (production entry point)
-    silver/                          Silver pipeline (production entry point)
-    gold/                            Gold warehouse pipeline (production entry point)
-    ml/                              ML feature engineering and training (production entry points)
-  sql/
-    silver/                          Silver profiling and validation SQL
-    gold/                            Gold validation SQL
-  resources/                         Databricks Job definitions (Asset Bundle resources)
+  notebooks/                         Interactive notebooks
+  src/{bronze,silver,gold,ml}/       Production entry points
+  sql/{silver,gold}/                 Validation SQL
+  resources/                         Databricks Job definitions
 flask_app/
-  app.py                             Flask app: loads the model, serves predictions
-  templates/index.html               Web form, generated from the model's serving metadata
-  model/                             Local copy of the champion model and serving metadata (not in Git)
-  requirements.txt                   Flask app dependencies
-docs/screenshots/gold/               Screenshots of the Gold warehouse tables and app
-databricks.yml                       Databricks Asset Bundle definition
+  app.py, templates/, model/, requirements.txt
+docs/screenshots/gold/
+databricks.yml
 ```
 
 ## Setup
 
-Three separate environments are involved, each with its own dependencies:
-
-1. Ingestion (root `requirements.txt`): Python 3.11+, AWS credentials available to `boto3`, and
-   the `S3_BUCKET_NAME` environment variable. See [Ingestion](#1-ingestion) above.
-2. Databricks: no local Python environment is required to run the pipelines themselves; they run
-   on Databricks compute. A local Databricks CLI profile is needed to deploy and trigger jobs (see
-   [Databricks Asset Bundle](#databricks-asset-bundle) above).
-3. Flask app (`flask_app/requirements.txt`): a separate virtual environment, since its dependency
-   set (scikit-learn, XGBoost, joblib) is unrelated to the ingestion script's. See
-   [Model serving](#4-model-serving-flask-app) above.
-
-All tests live under `tests/`, but they need different interpreters depending on what they cover.
-Running `python -m unittest discover -s tests -v` with the base interpreter runs the ingestion
-tests and automatically skips the ML/Flask tests (they say why in the skip reason, rather than
-silently passing):
+1. **Ingestion** (root `requirements.txt`): Python 3.11+, AWS credentials, `S3_BUCKET_NAME`.
+2. **Databricks**: no local env to run the pipelines, just a CLI profile to deploy/trigger jobs.
+3. **Flask** (`flask_app/requirements.txt`): its own venv.
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
 
-To actually run the ML pipeline and Flask app tests, use the Flask app's virtual environment,
-since it already has the same scikit-learn/XGBoost/pandas versions the training script needs:
+Runs the ingestion tests, skips the ML/Flask ones. To run those, use the Flask venv:
 
 ```powershell
 flask_app\.venv\Scripts\python.exe -m unittest tests.test_consumer_complaints_ml_train -v
 flask_app\.venv\Scripts\python.exe -m unittest tests.test_flask_app -v
 ```
 
-`test_flask_app.py` also includes a smoke test that catches a real bug I hit once during
-development: `champion_model.joblib`'s `feature_names_in_` silently drifting out of sync with
-`serving_metadata.json`'s `selected_feature_columns` (a stale file from a losing model run). That
-test is skipped if `flask_app/model/` is empty; run `flask_app\refresh_model.ps1` first.
+`test_flask_app.py` includes a smoke test for `champion_model.joblib` vs `serving_metadata.json`
+drift. Needs `flask_app\refresh_model.ps1` run first.
 
-## Engineering tradeoffs and open items
+## Tradeoffs
 
-- I select thresholds on a validation-only recall floor (75 percent) rather than by maximizing F1,
-  which is the correct approach for this use case: it guarantees the model catches most
-  untimely-response complaints instead of optimizing a blended score that can quietly trade recall
-  away. The 75 percent floor itself is a confirmed decision, not an open question: a missed
-  untimely complaint (false negative) is the kind of gap that shows up in a CFPB review, while an
-  over-flagged one (false positive) just costs a reviewer a few extra minutes, so recall is
-  prioritized over precision within reason. 75 percent catches most untimely-response complaints
-  while keeping precision (roughly 14 to 16 percent) high enough to still function as a filter.
-  Revisit it if reviewer capacity changes enough to absorb a higher floor's extra false positives,
-  or if a missed complaint turns out to cost more than assumed here.
-- Precision at that recall level is low (roughly 4 to 16 percent depending on the model), which is
-  mathematically inherent to catching most of a rare (0.6 percent) positive class, not a modeling
-  bug; pushing both precision and recall up further requires a more discriminative model, not a
-  different threshold.
-- I don't use the complaint narrative text itself as a feature yet, only a binary flag for whether
-  one was provided. Adding real text features (for example, embeddings from a pretrained
-  transformer) is a natural next step I've deliberately scoped out of this iteration; it requires
-  new plumbing in the Silver/Gold layers to retain the raw text, plus new feature-engineering and
-  training work.
-- I fixed hyperparameters for all three models by hand rather than tuning them via cross-validation
-  by default; an optional `ENABLE_HYPERPARAMETER_TUNING` flag runs a `GridSearchCV` search instead
-  when turned on. I verified the tuned path end to end on Databricks: it picked different
-  hyperparameters and improved test AUC-PR for two of the three models (XGBoost 0.403 to 0.416,
-  Random Forest 0.324 to 0.339), so it is left off by default because it costs meaningfully more
-  training time for a gain worth confirming is consistent across more than one run, not because it
-  is unverified or broken.
-- There is no automated retraining schedule or drift monitoring yet; the model is a manually
-  triggered batch training job today.
+- Recall floor (75%) is a confirmed decision: a missed untimely complaint costs more than an
+  over-flagged one, so thresholds target recall over precision. Precision at that level is ~14-16%.
+- No narrative text features yet, only a binary "has narrative" flag.
+- Hyperparameters are fixed by hand by default; `ENABLE_HYPERPARAMETER_TUNING` runs `GridSearchCV`
+  instead. Verified on Databricks, improved AUC-PR, left off by default pending more runs.
+- No automated retraining or drift monitoring; training is a manually triggered job.
