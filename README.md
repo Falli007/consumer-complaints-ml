@@ -173,11 +173,10 @@ The training flow I built, in order:
    and rejected it because it degenerated under this level of class imbalance with a modest
    calibration fold, collapsing to near-zero probabilities almost everywhere.
 8. Select a decision threshold on the other half of VALIDATION, targeting a recall floor (75
-   percent by default) rather than maximizing F1. F1 weights precision and recall equally, which
-   is the wrong objective for a compliance-style signal where I assume a missed untimely complaint
-   is costlier than an over-flagged timely one; I made this assumption configurable via the
-   `TARGET_RECALL_FLOOR` constant, and it should be confirmed against the real business cost of
-   each error type before being trusted in production.
+   percent, confirmed - see [Engineering tradeoffs](#engineering-tradeoffs-and-open-items) below)
+   rather than maximizing F1. F1 weights precision and recall equally, which is the wrong
+   objective for a compliance-style signal where a missed untimely complaint is costlier than an
+   over-flagged timely one.
 9. Evaluate every model on VALIDATION and TEST: AUC-ROC, AUC-PR, precision, recall, F2 and a full
    confusion matrix, all persisted to
    `fintech_lakehouse_dev.monitoring.consumer_complaints_timely_response_model_metrics`.
@@ -236,7 +235,16 @@ example) falls back to the global training-set positive rate rather than failing
 
 ### Refreshing the model
 
-After retraining on Databricks, I pull the two artifact files down from the Volume:
+After retraining on Databricks, I pull the two artifact files down from the Volume with one
+script:
+
+```powershell
+cd flask_app
+.\refresh_model.ps1
+```
+
+That wraps the two `databricks fs cp` commands (pass `-Profile <name>` if you use a different
+Databricks CLI profile than `consumer-complaints-dev`):
 
 ```powershell
 databricks fs cp "dbfs:/Volumes/fintech_lakehouse_dev/monitoring/model_exports/champion_model.joblib" flask_app/model/champion_model.joblib --profile consumer-complaints-dev --overwrite
