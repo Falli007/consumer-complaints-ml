@@ -8,6 +8,14 @@ sync:
   include:
     - databricks/src/**/*.py
     - databricks/notebooks/**/*.ipynb
+    - databricks/notebooks/consumer_complaints_ml_features.ipynb
+    - databricks/notebooks/consumer_complaints_ml_train.ipynb
+  # sync.include only ADDS patterns to what gets synced - it does not restrict sync to just these
+  # patterns. Without an explicit exclude, everything not already gitignored (flask_app/app.py,
+  # templates/, etc.) still gets uploaded to the workspace by default, even though the Flask app
+  # is a purely local artifact that never runs on Databricks.
+  exclude:
+    - flask_app/**
 
 targets:
   dev:

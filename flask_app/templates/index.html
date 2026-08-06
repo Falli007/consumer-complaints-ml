@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Consumer Complaint Untimely-Response Risk</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+    h1 { font-size: 1.4rem; }
+    label { display: block; margin-top: 0.9rem; font-weight: 600; font-size: 0.9rem; }
+    input { width: 100%; padding: 0.5rem; margin-top: 0.25rem; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px; }
+    button { margin-top: 1.5rem; padding: 0.6rem 1.2rem; background: #1a56db; color: white; border: none; border-radius: 4px; cursor: pointer; font-size: 1rem; }
+    button:hover { background: #1442ad; }
+    #result { margin-top: 1.5rem; padding: 1rem; border-radius: 6px; display: none; }
+    #result.timely { background: #e6f4ea; border: 1px solid #34a853; }
+    #result.untimely { background: #fce8e6; border: 1px solid #ea4335; }
+    .hint { color: #666; font-size: 0.8rem; margin-top: 0.2rem; }
+  </style>
+</head>
+<body>
+  <h1>Consumer Complaint &mdash; Untimely-Response Risk</h1>
+  <p class="hint">Scores a complaint using the champion model trained on the CFPB consumer complaints pipeline.</p>
+
+  <form id="predict-form">
+    {% for field in fields %}
+    <label for="{{ field.name }}">{{ field.name }}</label>
+    <input type="{{ 'number' if field.type == 'numeric' else 'text' }}" id="{{ field.name }}" name="{{ field.name }}" required>
+    {% endfor %}
+    <button type="submit">Score complaint</button>
+  </form>
+
+  <div id="result"></div>
+
+  <script>
+    const form = document.getElementById('predict-form');
+    const resultBox = document.getElementById('result');
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const formData = new FormData(form);
+      const payload = {};
+      formData.forEach((value, key) => { payload[key] = value; });
+
+      resultBox.style.display = 'block';
+      resultBox.className = '';
+      resultBox.textContent = 'Scoring...';
+
+      try {
+        const response = await fetch('/predict', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.detail || 'Request failed');
+        }
+        resultBox.className = data.prediction_label;
+        resultBox.innerHTML = `
+          <strong>Prediction: ${data.prediction_label}</strong><br>
+          Probability of untimely response: ${(data.predicted_probability_untimely * 100).toFixed(1)}%<br>
+          Decision threshold: ${(data.threshold_used * 100).toFixed(1)}%
+        `;
+      } catch (error) {
+        resultBox.className = '';
+        resultBox.textContent = 'Error: ' + error.message;
+      }
+    });
+  </script>
+</body>
+</html>

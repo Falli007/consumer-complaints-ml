@@ -48,3 +48,46 @@ resources:
           spec:
             environment_version: "2"
             dependencies: []
+
+    consumer_complaints_ml_job:
+      name: consumer-complaints-ml-${bundle.target}
+
+      description: >
+        Builds the consumer complaints ML feature table and trains a baseline
+        untimely-response classifier from the Gold warehouse layer.
+
+      max_concurrent_runs: 1
+
+      tasks:
+        - task_key: build_consumer_complaints_ml_features
+
+          notebook_task:
+            notebook_path: ../notebooks/consumer_complaints_ml_features.ipynb
+            source: WORKSPACE
+
+          environment_key: ml
+          timeout_seconds: 14400
+
+        - task_key: train_consumer_complaints_ml_baseline
+
+          depends_on:
+            - task_key: build_consumer_complaints_ml_features
+
+          notebook_task:
+            notebook_path: ../notebooks/consumer_complaints_ml_train.ipynb
+            source: WORKSPACE
+
+          environment_key: ml
+          timeout_seconds: 14400
+
+      environments:
+        - environment_key: default
+          spec:
+            environment_version: "2"
+            dependencies: []
+        - environment_key: ml
+          spec:
+            environment_version: "2"
+            dependencies:
+              - xgboost==2.1.4
+              - scikit-learn==1.5.2

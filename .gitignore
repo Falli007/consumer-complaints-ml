@@ -7,3 +7,5 @@ __pycache__/
 *.pyc
 *.pyo
 *.part
+flask_app/.venv/
+flask_app/model/
