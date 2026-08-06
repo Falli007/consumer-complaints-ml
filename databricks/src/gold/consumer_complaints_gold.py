@@ -167,10 +167,13 @@ def build_dim_product(silver_dataframe: DataFrame) -> DataFrame:
             "_sort_product",
             F.coalesce(F.col("product"), F.lit(MISSING_MEMBER_LABEL)),
         )
-        .withColumn(
-            "sub_product",
-            F.coalesce(F.col("sub_product"), F.lit(MISSING_MEMBER_LABEL)),
-        )
+        # product/sub_product are NOT coalesced here (unlike the sort columns above) - they must
+        # stay real nulls when the source is null, so the eqNullSafe join in
+        # build_fact_consumer_complaints correctly matches null <=> null. Coalescing them to
+        # MISSING_MEMBER_LABEL here would make that join compare null (Silver) against
+        # "NOT_PROVIDED" (this dimension), which never matches, silently routing every row with a
+        # missing sub_product into the generic product_key=0 fallback instead of the correct,
+        # more specific dimension row.
         .withColumn(
             "_sort_sub_product",
             F.coalesce(F.col("sub_product"), F.lit(MISSING_MEMBER_LABEL)),
@@ -256,11 +259,10 @@ def build_dim_state(silver_dataframe: DataFrame) -> DataFrame:
     base_dimension = (
         silver_dataframe
         .select("state")
-        .withColumn(
-            "state",
-            F.coalesce(F.col("state"), F.lit(MISSING_MEMBER_LABEL)),
-        )
         .distinct()
+        # state is NOT coalesced (see the matching note in build_dim_product) - it must stay a
+        # real null so the eqNullSafe join in build_fact_consumer_complaints matches null <=> null
+        # instead of comparing null against a coalesced "NOT_PROVIDED" and always missing.
         .withColumn(
             "_sort_state",
             F.coalesce(F.col("state"), F.lit(MISSING_MEMBER_LABEL)),
