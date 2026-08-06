@@ -160,7 +160,3 @@ drift. Needs `flask_app\refresh_model.ps1` run first.
 
 - Recall floor (75%) is a confirmed decision: a missed untimely complaint costs more than an
   over-flagged one, so thresholds target recall over precision. Precision at that level is ~14-16%.
-- No narrative text features yet, only a binary "has narrative" flag.
-- Hyperparameters are fixed by hand by default; `ENABLE_HYPERPARAMETER_TUNING` runs `GridSearchCV`
-  instead. Verified on Databricks, improved AUC-PR, left off by default pending more runs.
-- No automated retraining or drift monitoring; training is a manually triggered job.
