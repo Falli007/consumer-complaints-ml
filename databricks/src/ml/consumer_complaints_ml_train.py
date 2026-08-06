@@ -432,12 +432,14 @@ def select_top_features(train_pdf: pd.DataFrame) -> tuple[list[str], list[tuple[
 # Fit Decision Tree, Random Forest, and XGBoost on the selected
 # feature representation for a fair comparison.
 # ------------------------------------------------------------
-# NEEDS STAKEHOLDER REVIEW: this value is an unconfirmed assumption, not an approved business
-# requirement. ASSUMPTION (opinion): this model is a compliance/monitoring signal, so a missed
-# truly-late complaint (false negative) is treated as costlier than an over-flagged timely one
-# (false positive). This constant is the one thing to change if that cost asymmetry is wrong;
-# confirm the real number with whoever owns the downstream use of this prediction before relying
-# on it in production.
+# CONFIRMED (project owner, 2026-08-06): this model is a compliance/monitoring signal, so a
+# missed truly-late complaint (false negative) is treated as costlier than an over-flagged timely
+# one (false positive) - a missed complaint is the kind of gap that shows up in a CFPB review; an
+# over-flagged one just costs a reviewer a few extra minutes. 75% recall was chosen as the floor
+# because it catches most untimely-response complaints while keeping precision (~14-16%) high
+# enough to still function as a filter rather than flagging nearly everything. Revisit this number
+# if reviewer capacity changes enough to absorb a higher floor's extra false positives, or if a
+# missed complaint turns out to cost more than assumed here.
 TARGET_RECALL_FLOOR = 0.75
 CALIBRATION_METHOD = "sigmoid"  # See _fit_score_and_log_model for why isotonic was rejected.
 

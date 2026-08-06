@@ -346,10 +346,13 @@ test is skipped if `flask_app/model/` is empty; run `flask_app\refresh_model.ps1
 - I select thresholds on a validation-only recall floor (75 percent) rather than by maximizing F1,
   which is the correct approach for this use case: it guarantees the model catches most
   untimely-response complaints instead of optimizing a blended score that can quietly trade recall
-  away. The one open input is the exact floor value, 75 percent, which encodes an assumption I
-  made about the relative cost of a missed untimely complaint versus an over-flagged timely one;
-  that number, not the method, should be confirmed with a stakeholder against the actual
-  downstream use of this signal.
+  away. The 75 percent floor itself is a confirmed decision, not an open question: a missed
+  untimely complaint (false negative) is the kind of gap that shows up in a CFPB review, while an
+  over-flagged one (false positive) just costs a reviewer a few extra minutes, so recall is
+  prioritized over precision within reason. 75 percent catches most untimely-response complaints
+  while keeping precision (roughly 14 to 16 percent) high enough to still function as a filter.
+  Revisit it if reviewer capacity changes enough to absorb a higher floor's extra false positives,
+  or if a missed complaint turns out to cost more than assumed here.
 - Precision at that recall level is low (roughly 4 to 16 percent depending on the model), which is
   mathematically inherent to catching most of a rare (0.6 percent) positive class, not a modeling
   bug; pushing both precision and recall up further requires a more discriminative model, not a
